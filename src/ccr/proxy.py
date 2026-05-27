@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import socket
 from typing import Any
 
 from aiohttp import web, ClientSession, ClientTimeout
+
+logger = logging.getLogger(__name__)
 
 from .converter import (
     anthropic_to_openai_request,
@@ -99,45 +102,84 @@ class ProxyServer:
         await response.prepare(request)
 
         converter = StreamConverter(model=self.model)
+        client_disconnected = False
 
-        for event in converter.start_events():
-            await response.write(event.encode())
+        def _is_disconnect(exc: BaseException) -> bool:
+            return isinstance(exc, (
+                ConnectionResetError,
+                BrokenPipeError,
+                ConnectionAbortedError,
+            )) or "Cannot write to closing transport" in str(exc)
 
-        buffer = ""
-        async for chunk_bytes in upstream.content.iter_any():
-            buffer += chunk_bytes.decode("utf-8", errors="replace")
+        async def _safe_write(data: bytes) -> bool:
+            nonlocal client_disconnected
+            if client_disconnected:
+                return False
+            try:
+                await response.write(data)
+                return True
+            except BaseException as exc:
+                if _is_disconnect(exc):
+                    client_disconnected = True
+                    logger.debug("Client disconnected, stopping stream")
+                    return False
+                raise
 
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                line = line.strip()
+        try:
+            for event in converter.start_events():
+                if not await _safe_write(event.encode()):
+                    return response
 
-                if not line:
-                    continue
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str.strip() == "[DONE]":
-                        for event in converter.finish_events("stop"):
-                            await response.write(event.encode())
+            buffer = ""
+            async for chunk_bytes in upstream.content.iter_any():
+                if client_disconnected:
+                    break
+
+                buffer += chunk_bytes.decode("utf-8", errors="replace")
+
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+
+                    if not line:
                         continue
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            for event in converter.finish_events("stop"):
+                                if not await _safe_write(event.encode()):
+                                    return response
+                            continue
 
+                        try:
+                            chunk = json.loads(data_str)
+                            for event in converter.feed_chunk(chunk):
+                                if not await _safe_write(event.encode()):
+                                    return response
+                        except json.JSONDecodeError:
+                            continue
+
+            if not client_disconnected and buffer.strip():
+                line = buffer.strip()
+                if line.startswith("data: ") and line[6:].strip() != "[DONE]":
                     try:
-                        chunk = json.loads(data_str)
+                        chunk = json.loads(line[6:])
                         for event in converter.feed_chunk(chunk):
-                            await response.write(event.encode())
+                            if not await _safe_write(event.encode()):
+                                return response
                     except json.JSONDecodeError:
-                        continue
+                        pass
 
-        if buffer.strip():
-            line = buffer.strip()
-            if line.startswith("data: ") and line[6:].strip() != "[DONE]":
-                try:
-                    chunk = json.loads(line[6:])
-                    for event in converter.feed_chunk(chunk):
-                        await response.write(event.encode())
-                except json.JSONDecodeError:
-                    pass
+            if not client_disconnected:
+                await response.write_eof()
+        except asyncio.CancelledError:
+            logger.debug("Stream cancelled by client")
+        except BaseException as exc:
+            if _is_disconnect(exc):
+                logger.debug("Client disconnected during stream")
+            else:
+                logger.error("Stream error: %s", exc)
 
-        await response.write_eof()
         return response
 
 
