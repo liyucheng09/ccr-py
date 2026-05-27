@@ -19,6 +19,14 @@ from .converter import (
 )
 
 
+def _is_disconnect(exc: BaseException) -> bool:
+    return isinstance(exc, (
+        ConnectionResetError,
+        BrokenPipeError,
+        ConnectionAbortedError,
+    )) or "Cannot write to closing transport" in str(exc)
+
+
 class ProxyServer:
     def __init__(self, api_url: str, api_key: str = "dummy", model: str = "", port: int = 0):
         self.api_url = api_url
@@ -56,6 +64,18 @@ class ProxyServer:
         return web.json_response({"status": "ok"})
 
     async def _handle_messages(self, request: web.Request) -> web.StreamResponse:
+        try:
+            return await self._handle_messages_inner(request)
+        except asyncio.CancelledError:
+            logger.debug("Request cancelled by client")
+            raise
+        except BaseException as exc:
+            if _is_disconnect(exc):
+                logger.debug("Client disconnected")
+                return web.Response(status=499)
+            raise
+
+    async def _handle_messages_inner(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         is_stream = body.get("stream", False)
 
@@ -99,17 +119,16 @@ class ProxyServer:
                 "Connection": "keep-alive",
             },
         )
-        await response.prepare(request)
+        try:
+            await response.prepare(request)
+        except BaseException as exc:
+            if _is_disconnect(exc):
+                logger.debug("Client disconnected before stream started")
+                return response
+            raise
 
         converter = StreamConverter(model=self.model)
         client_disconnected = False
-
-        def _is_disconnect(exc: BaseException) -> bool:
-            return isinstance(exc, (
-                ConnectionResetError,
-                BrokenPipeError,
-                ConnectionAbortedError,
-            )) or "Cannot write to closing transport" in str(exc)
 
         async def _safe_write(data: bytes) -> bool:
             nonlocal client_disconnected
@@ -171,7 +190,13 @@ class ProxyServer:
                         pass
 
             if not client_disconnected:
-                await response.write_eof()
+                try:
+                    await response.write_eof()
+                except BaseException as exc:
+                    if _is_disconnect(exc):
+                        logger.debug("Client disconnected during stream close")
+                    else:
+                        raise
         except asyncio.CancelledError:
             logger.debug("Stream cancelled by client")
         except BaseException as exc:
