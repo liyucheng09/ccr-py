@@ -1,0 +1,17 @@
+profiles:
+  # Direct mode: set env vars and launch claude directly
+  my-claude:
+    type: direct
+    env:
+      ANTHROPIC_AUTH_TOKEN: "your-api-key-here"
+      ANTHROPIC_BASE_URL: "https://api.anthropic.com"
+      ANTHROPIC_MODEL: "claude-opus-4-6-20260205"
+      DISABLE_TELEMETRY: "true"
+      DISABLE_COST_WARNINGS: "true"
+
+  # Proxy mode: start a local proxy that converts OpenAI API to Anthropic API
+  local-model:
+    type: proxy
+    api_url: "http://localhost:8000/v1/chat/completions"
+    api_key: "dummy"
+    model: "my-model"
