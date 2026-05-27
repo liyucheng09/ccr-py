@@ -44,12 +44,17 @@ def main():
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def run(profile_name: str, claude_args: tuple[str, ...]):
     """Launch claude with a profile."""
+    args = list(claude_args)
+    use_happy = "--happy" in args
+    if use_happy:
+        args.remove("--happy")
+
     profile = get_profile(profile_name)
 
     if isinstance(profile, DirectProfile):
-        _run_direct(profile, list(claude_args))
+        _run_direct(profile, args, use_happy)
     else:
-        _run_proxy(profile, list(claude_args))
+        _run_proxy(profile, args, use_happy)
 
 
 @main.command("list")
@@ -98,21 +103,24 @@ def activate(profile_name: str):
         click.echo(f"export {key}={_shell_quote(value)}")
 
 
-def _run_direct(profile: DirectProfile, claude_args: list[str]):
-    claude_path = _find_claude()
+def _run_direct(profile: DirectProfile, claude_args: list[str], use_happy: bool = False):
     env = {**os.environ, **profile.env}
-    args = [claude_path] + claude_args
-    os.execvpe(claude_path, args, env)
+    if use_happy:
+        happy_path = _find_happy()
+        args = [happy_path] + claude_args
+        os.execvpe(happy_path, args, env)
+    else:
+        claude_path = _find_claude()
+        args = [claude_path] + claude_args
+        os.execvpe(claude_path, args, env)
 
 
-def _run_proxy(profile: ProxyProfile, claude_args: list[str]):
-    asyncio.run(_run_proxy_async(profile, claude_args))
+def _run_proxy(profile: ProxyProfile, claude_args: list[str], use_happy: bool = False):
+    asyncio.run(_run_proxy_async(profile, claude_args, use_happy))
 
 
-async def _run_proxy_async(profile: ProxyProfile, claude_args: list[str]):
+async def _run_proxy_async(profile: ProxyProfile, claude_args: list[str], use_happy: bool = False):
     from .proxy import run_proxy_until_done
-
-    claude_path = _find_claude()
 
     server, port = await run_proxy_until_done(
         api_url=profile.api_url,
@@ -125,7 +133,13 @@ async def _run_proxy_async(profile: ProxyProfile, claude_args: list[str]):
 
     proxy_env = build_proxy_env(port)
     env = {**os.environ, **proxy_env}
-    args = [claude_path] + claude_args
+
+    if use_happy:
+        happy_path = _find_happy()
+        args = [happy_path] + claude_args
+    else:
+        claude_path = _find_claude()
+        args = [claude_path] + claude_args
 
     proc = await asyncio.create_subprocess_exec(*args, env=env)
 
@@ -145,6 +159,14 @@ def _find_claude() -> str:
     path = os.environ.get("CLAUDE_PATH") or shutil.which("claude")
     if not path:
         click.echo("Claude Code not found. Install: npm install -g @anthropic-ai/claude-code", err=True)
+        sys.exit(1)
+    return path
+
+
+def _find_happy() -> str:
+    path = os.environ.get("HAPPY_PATH") or shutil.which("happy")
+    if not path:
+        click.echo("Happy CLI not found. Install: npm install -g happy", err=True)
         sys.exit(1)
     return path
 
