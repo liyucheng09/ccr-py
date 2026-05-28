@@ -9,6 +9,7 @@ import socket
 from typing import Any
 
 from aiohttp import web, ClientSession, ClientTimeout
+from aiohttp.client_exceptions import ClientConnectionResetError as _ClientConnReset
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ def _is_disconnect(exc: BaseException) -> bool:
         ConnectionResetError,
         BrokenPipeError,
         ConnectionAbortedError,
+        _ClientConnReset,
     )) or "Cannot write to closing transport" in str(exc)
 
 
@@ -124,7 +126,6 @@ class ProxyServer:
         except BaseException as exc:
             if _is_disconnect(exc):
                 logger.debug("Client disconnected before stream started")
-                return response
             raise
 
         converter = StreamConverter(model=self.model)
