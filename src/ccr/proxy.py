@@ -30,11 +30,12 @@ def _is_disconnect(exc: BaseException) -> bool:
 
 
 class ProxyServer:
-    def __init__(self, api_url: str, api_key: str = "dummy", model: str = "", port: int = 0):
+    def __init__(self, api_url: str, api_key: str = "dummy", model: str = "", port: int = 0, max_output_tokens: int | None = None):
         self.api_url = api_url
         self.api_key = api_key
         self.model = model
         self.port = port
+        self.max_output_tokens = max_output_tokens
         self._runner: web.AppRunner | None = None
         self._actual_port: int = 0
 
@@ -81,7 +82,7 @@ class ProxyServer:
         body = await request.json()
         is_stream = body.get("stream", False)
 
-        openai_req = anthropic_to_openai_request(body, model_override=self.model)
+        openai_req = anthropic_to_openai_request(body, model_override=self.model, max_output_tokens=self.max_output_tokens)
 
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -220,8 +221,9 @@ async def run_proxy_until_done(
     api_key: str,
     model: str,
     port: int = 0,
+    max_output_tokens: int | None = None,
 ) -> tuple[ProxyServer, int]:
     """Start proxy and return (server, port). Caller is responsible for stopping."""
-    server = ProxyServer(api_url=api_url, api_key=api_key, model=model, port=port)
+    server = ProxyServer(api_url=api_url, api_key=api_key, model=model, port=port, max_output_tokens=max_output_tokens)
     actual_port = await server.start()
     return server, actual_port

@@ -29,6 +29,9 @@ class ProxyProfile:
     api_key: str = "dummy"
     model: str = ""
     proxy_port: int = 0
+    max_output_tokens: int | None = None
+    max_context_tokens: int | None = None
+    autocompact_pct: int | None = None
 
     @property
     def type(self) -> str:
@@ -43,12 +46,18 @@ def _parse_profile(name: str, data: dict[str, Any]) -> Profile:
     if ptype == "direct":
         return DirectProfile(name=name, env=dict(data.get("env", {})))
     if ptype == "proxy":
+        raw_max_out = data.get("max_output_tokens")
+        raw_max_ctx = data.get("max_context_tokens")
+        raw_ac_pct = data.get("autocompact_pct")
         return ProxyProfile(
             name=name,
             api_url=data["api_url"],
             api_key=data.get("api_key", "dummy"),
             model=data.get("model", ""),
             proxy_port=data.get("proxy_port", 0),
+            max_output_tokens=int(raw_max_out) if raw_max_out is not None else None,
+            max_context_tokens=int(raw_max_ctx) if raw_max_ctx is not None else None,
+            autocompact_pct=int(raw_ac_pct) if raw_ac_pct is not None else None,
         )
     print(f"Unknown profile type '{ptype}' for '{name}'", file=sys.stderr)
     sys.exit(1)
@@ -91,8 +100,8 @@ def env_for_profile(profile: Profile) -> dict[str, str]:
     raise RuntimeError("Call build_proxy_env() for proxy profiles")
 
 
-def build_proxy_env(port: int) -> dict[str, str]:
-    return {
+def build_proxy_env(port: int, max_output_tokens: int | None = None, max_context_tokens: int | None = None, autocompact_pct: int | None = None) -> dict[str, str]:
+    env = {
         "ANTHROPIC_AUTH_TOKEN": "ccr-proxy",
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
         "NO_PROXY": "127.0.0.1",
@@ -100,3 +109,10 @@ def build_proxy_env(port: int) -> dict[str, str]:
         "DISABLE_COST_WARNINGS": "true",
         "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
     }
+    if max_output_tokens is not None:
+        env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
+    if max_context_tokens is not None:
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(max_context_tokens)
+    if autocompact_pct is not None:
+        env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(autocompact_pct)
+    return env

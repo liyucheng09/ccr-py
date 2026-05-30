@@ -96,7 +96,7 @@ def activate(profile_name: str):
     else:
         click.echo("# Proxy profile - environment shown with placeholder port.", err=True)
         click.echo("# Use 'ccr <profile>' to auto-start proxy with real port.", err=True)
-        env = build_proxy_env(port=0)
+        env = build_proxy_env(port=0, max_output_tokens=profile.max_output_tokens, max_context_tokens=profile.max_context_tokens, autocompact_pct=profile.autocompact_pct)
         env["_CCR_NOTE"] = f"proxy_target={profile.api_url}"
 
     for key, value in sorted(env.items()):
@@ -127,11 +127,12 @@ async def _run_proxy_async(profile: ProxyProfile, claude_args: list[str], use_ha
         api_key=profile.api_key,
         model=profile.model,
         port=profile.proxy_port,
+        max_output_tokens=profile.max_output_tokens,
     )
 
     click.echo(f"Proxy started on 127.0.0.1:{port} → {profile.api_url}", err=True)
 
-    proxy_env = build_proxy_env(port)
+    proxy_env = build_proxy_env(port, max_output_tokens=profile.max_output_tokens, max_context_tokens=profile.max_context_tokens, autocompact_pct=profile.autocompact_pct)
     env = {**os.environ, **proxy_env}
 
     if use_happy:

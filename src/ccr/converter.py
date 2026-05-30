@@ -10,7 +10,7 @@ from typing import Any
 
 # ── Anthropic request → OpenAI request ──────────────────────────────
 
-def anthropic_to_openai_request(body: dict[str, Any], model_override: str = "") -> dict[str, Any]:
+def anthropic_to_openai_request(body: dict[str, Any], model_override: str = "", max_output_tokens: int | None = None) -> dict[str, Any]:
     messages = _convert_messages(body.get("system"), body.get("messages", []))
     tools = _convert_tools(body.get("tools"))
 
@@ -20,8 +20,11 @@ def anthropic_to_openai_request(body: dict[str, Any], model_override: str = "") 
         "stream": body.get("stream", False),
     }
 
-    if body.get("max_tokens"):
-        req["max_tokens"] = body["max_tokens"]
+    max_tokens = body.get("max_tokens")
+    if max_tokens and max_output_tokens:
+        max_tokens = min(max_tokens, max_output_tokens)
+    if max_tokens:
+        req["max_tokens"] = max_tokens
     if body.get("temperature") is not None:
         req["temperature"] = body["temperature"]
     if body.get("top_p") is not None:
