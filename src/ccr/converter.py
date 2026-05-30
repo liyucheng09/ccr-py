@@ -20,6 +20,9 @@ def anthropic_to_openai_request(body: dict[str, Any], model_override: str = "", 
         "stream": body.get("stream", False),
     }
 
+    if body.get("stream"):
+        req["stream_options"] = {"include_usage": True}
+
     max_tokens = body.get("max_tokens")
     if max_tokens and max_output_tokens:
         max_tokens = min(max_tokens, max_output_tokens)
@@ -215,6 +218,7 @@ def openai_to_anthropic_response(resp: dict[str, Any], model: str = "") -> dict[
 
     stop_reason = _map_finish_reason(choice.get("finish_reason"))
     usage = resp.get("usage", {})
+    details = usage.get("prompt_tokens_details") or {}
 
     return {
         "id": f"msg_{uuid.uuid4().hex[:24]}",
@@ -225,8 +229,9 @@ def openai_to_anthropic_response(resp: dict[str, Any], model: str = "") -> dict[
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
-            "input_tokens": usage.get("prompt_tokens", 0),
+            "input_tokens": usage.get("prompt_tokens", 0) - details.get("cached_tokens", 0),
             "output_tokens": usage.get("completion_tokens", 0),
+            "cache_read_input_tokens": details.get("cached_tokens", 0),
         },
     }
 
@@ -247,6 +252,8 @@ class StreamConverter:
         self._thinking_ended = False
         self._next_block_index = 0
         self._finished = False
+        self._final_usage: dict[str, Any] | None = None
+        self._finish_reason: str | None = None
 
     def _close_thinking_events(self) -> list[str]:
         """Emit signature_delta + content_block_stop for the thinking block."""
@@ -280,7 +287,7 @@ class StreamConverter:
                     "content": [],
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                    "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0},
                 },
             }),
         ]
@@ -293,6 +300,13 @@ class StreamConverter:
 
         choices = chunk.get("choices", [])
         if not choices:
+            # Capture usage from the final streaming chunk (sent when stream_options.include_usage is true)
+            chunk_usage = chunk.get("usage")
+            if chunk_usage:
+                self._final_usage = chunk_usage
+            # If finish was pending, emit closing events now that we have usage data
+            if self._finish_reason:
+                events.extend(self.finish_events(self._finish_reason))
             return events
 
         delta = choices[0].get("delta", {})
@@ -376,9 +390,10 @@ class StreamConverter:
                         },
                     }))
 
-        # Finish
+        # Finish — don't emit message_delta yet; the usage-only chunk
+        # (from stream_options.include_usage) may arrive after finish_reason.
         if finish_reason:
-            events.extend(self.finish_events(finish_reason, chunk.get("usage")))
+            self._finish_reason = finish_reason
 
         return events
 
@@ -399,14 +414,20 @@ class StreamConverter:
             events.append(_sse("content_block_stop", {"type": "content_block_stop", "index": buf["_block_index"]}))
 
         stop_reason = _map_finish_reason(finish_reason)
+        final = self._final_usage or usage
         output_tokens = 0
-        if usage and usage.get("completion_tokens"):
-            output_tokens = usage["completion_tokens"]
+        input_tokens = 0
+        cache_read = 0
+        if final:
+            output_tokens = final.get("completion_tokens", 0)
+            details = final.get("prompt_tokens_details") or {}
+            input_tokens = final.get("prompt_tokens", 0) - details.get("cached_tokens", 0)
+            cache_read = details.get("cached_tokens", 0)
 
         events.append(_sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": output_tokens},
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens, "cache_read_input_tokens": cache_read},
         }))
         events.append(_sse("message_stop", {"type": "message_stop"}))
         return events
