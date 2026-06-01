@@ -7,6 +7,7 @@ import os
 import signal
 import sys
 import shutil
+import time
 
 import click
 
@@ -18,6 +19,13 @@ from .config import (
     ProxyProfile,
     CONFIG_FILE,
 )
+from .server_state import (
+    save_server_info,
+    is_server_running,
+    get_server_port,
+    stop_server,
+    list_running_servers,
+)
 
 
 class CCRGroup(click.Group):
@@ -25,7 +33,7 @@ class CCRGroup(click.Group):
 
     def resolve_command(self, ctx, args):
         cmd_name = args[0] if args else None
-        if cmd_name and cmd_name not in self.commands and not cmd_name.startswith("-"):
+        if cmd_name and cmd_name not in self.commands and not cmd_name.startswith("-") and not cmd_name.startswith("_"):
             return "run", self.commands["run"], args
         return super().resolve_command(ctx, args)
 
@@ -57,6 +65,130 @@ def run(profile_name: str, claude_args: tuple[str, ...]):
         _run_proxy(profile, args, use_happy)
 
 
+@main.command()
+@click.argument("profile_name")
+def start(profile_name: str):
+    """Start a persistent proxy server for a profile.
+
+    Only works with proxy-type profiles (e.g. glm5).
+    The server runs in the background until 'ccr stop' is called.
+    """
+    profile = get_profile(profile_name)
+
+    if isinstance(profile, DirectProfile):
+        click.echo(f"Profile '{profile_name}' is a direct profile and does not need a server.", err=True)
+        sys.exit(1)
+
+    if is_server_running(profile_name):
+        port = get_server_port(profile_name)
+        click.echo(f"Proxy server for '{profile_name}' is already running on port {port}.")
+        return
+
+    # Spawn background process: ccr serve <profile>
+    ccr_path = shutil.which("ccr")
+    if not ccr_path:
+        ccr_path = sys.executable.replace("python", "ccr")
+
+    import subprocess
+    # Capture stderr to surface startup errors (e.g. port in use)
+    stderr_pipe = subprocess.PIPE
+    proc = subprocess.Popen(
+        [ccr_path, "serve", profile_name],
+        stdout=subprocess.DEVNULL,
+        stderr=stderr_pipe,
+        start_new_session=True,
+    )
+
+    # Wait for server to become ready
+    import urllib.request
+    import urllib.error
+
+    for _ in range(50):  # up to ~5 seconds
+        time.sleep(0.1)
+        port = get_server_port(profile_name)
+        if port is None:
+            # Check if the process died
+            if proc.poll() is not None:
+                stderr_out = proc.stderr.read().decode(errors="replace").strip() if proc.stderr else ""
+                msg = f"Failed to start proxy server for '{profile_name}'."
+                if stderr_out:
+                    msg += f"\n{stderr_out}"
+                click.echo(msg, err=True)
+                sys.exit(1)
+            continue
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
+            click.echo(f"Proxy server for '{profile_name}' started on 127.0.0.1:{port} -> {profile.api_url}")
+            return
+        except (urllib.error.URLError, OSError):
+            continue
+
+    click.echo(f"Timeout waiting for proxy server for '{profile_name}' to start.", err=True)
+    sys.exit(1)
+
+
+@main.command()
+@click.argument("profile_name", required=False)
+def stop(profile_name: str | None):
+    """Stop a persistent proxy server.
+
+    If no profile is specified, stops all running servers.
+    """
+    if profile_name:
+        if not is_server_running(profile_name):
+            click.echo(f"No running server for '{profile_name}'.")
+            return
+        stop_server(profile_name)
+        click.echo(f"Proxy server for '{profile_name}' stopped.")
+    else:
+        servers = list_running_servers()
+        if not servers:
+            click.echo("No running proxy servers.")
+            return
+        for name in servers:
+            stop_server(name)
+            click.echo(f"Proxy server for '{name}' stopped.")
+
+
+@main.command()
+@click.argument("profile_name")
+def restart(profile_name: str):
+    """Restart a persistent proxy server."""
+    profile = get_profile(profile_name)
+
+    if isinstance(profile, DirectProfile):
+        click.echo(f"Profile '{profile_name}' is a direct profile and does not need a server.", err=True)
+        sys.exit(1)
+
+    if is_server_running(profile_name):
+        stop_server(profile_name)
+        click.echo(f"Proxy server for '{profile_name}' stopped.")
+
+    # Reuse start logic
+    ctx = click.get_current_context()
+    ctx.invoke(start, profile_name=profile_name)
+
+
+@main.command()
+def status():
+    """Show status of persistent proxy servers."""
+    servers = list_running_servers()
+    if not servers:
+        click.echo("No running proxy servers.")
+        return
+
+    profiles = load_config()
+
+    max_name = max(len(n) for n in servers)
+    click.echo(f"{'PROFILE':<{max_name+2}} {'PID':<8} {'PORT':<8} UPSTREAM")
+    click.echo(f"{'─'*(max_name+2)} {'─'*8} {'─'*8} {'─'*40}")
+
+    for name, (pid, port) in sorted(servers.items()):
+        profile = profiles.get(name)
+        upstream = profile.api_url if isinstance(profile, ProxyProfile) else "?"
+        click.echo(f"{name:<{max_name+2}} {pid:<8} {port:<8} {upstream}")
+
+
 @main.command("list")
 def list_profiles():
     """List all configured profiles."""
@@ -77,9 +209,22 @@ def list_profiles():
             model = profile.env.get("ANTHROPIC_MODEL", "")
             detail = model if model else base_url
         else:
-            detail = f"{profile.api_url} → {profile.model}"
+            detail = f"{profile.api_url} -> {profile.model}"
 
         click.echo(f"{name:<{max_name+2}} {profile.type:<{max_type+2}} {detail}")
+
+
+@main.command("serve", hidden=True)
+@click.argument("profile_name")
+def serve(profile_name: str):
+    """Internal: run a persistent proxy server. Called by 'ccr start'."""
+    profile = get_profile(profile_name)
+
+    if isinstance(profile, DirectProfile):
+        click.echo(f"Cannot serve a direct profile.", err=True)
+        sys.exit(1)
+
+    asyncio.run(_serve_async(profile_name, profile))
 
 
 @main.command()
@@ -94,13 +239,52 @@ def activate(profile_name: str):
     if isinstance(profile, DirectProfile):
         env = dict(profile.env)
     else:
-        click.echo("# Proxy profile - environment shown with placeholder port.", err=True)
-        click.echo("# Use 'ccr <profile>' to auto-start proxy with real port.", err=True)
-        env = build_proxy_env(port=0, max_output_tokens=profile.max_output_tokens, max_context_tokens=profile.max_context_tokens, autocompact_pct=profile.autocompact_pct)
-        env["_CCR_NOTE"] = f"proxy_target={profile.api_url}"
+        # Check if a persistent server is running
+        port = get_server_port(profile_name)
+        if port is not None:
+            env = build_proxy_env(port, max_output_tokens=profile.max_output_tokens, max_context_tokens=profile.max_context_tokens, autocompact_pct=profile.autocompact_pct)
+        else:
+            click.echo("# Proxy profile - no persistent server running.", err=True)
+            click.echo("# Use 'ccr start <profile>' first, or 'ccr <profile>' for ephemeral proxy.", err=True)
+            env = build_proxy_env(port=0, max_output_tokens=profile.max_output_tokens, max_context_tokens=profile.max_context_tokens, autocompact_pct=profile.autocompact_pct)
+            env["_CCR_NOTE"] = f"proxy_target={profile.api_url}"
 
     for key, value in sorted(env.items()):
         click.echo(f"export {key}={_shell_quote(value)}")
+
+
+async def _serve_async(profile_name: str, profile: ProxyProfile):
+    from .proxy import ProxyServer
+
+    server = ProxyServer(
+        api_url=profile.api_url,
+        api_key=profile.api_key,
+        model=profile.model,
+        port=profile.proxy_port,
+        max_output_tokens=profile.max_output_tokens,
+    )
+    actual_port = await server.start()
+
+    save_server_info(profile_name, os.getpid(), actual_port)
+
+    click.echo(f"Serving '{profile_name}' on 127.0.0.1:{actual_port} -> {profile.api_url}", err=True)
+
+    loop = asyncio.get_event_loop()
+    stop_event = asyncio.Event()
+
+    def _sig_handler():
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _sig_handler)
+
+    try:
+        await stop_event.wait()
+    finally:
+        from .server_state import remove_server_info
+        await server.stop()
+        remove_server_info(profile_name)
+        click.echo(f"Proxy server for '{profile_name}' stopped.", err=True)
 
 
 def _run_direct(profile: DirectProfile, claude_args: list[str], use_happy: bool = False):
@@ -116,7 +300,34 @@ def _run_direct(profile: DirectProfile, claude_args: list[str], use_happy: bool 
 
 
 def _run_proxy(profile: ProxyProfile, claude_args: list[str], use_happy: bool = False):
-    asyncio.run(_run_proxy_async(profile, claude_args, use_happy))
+    # Check if a persistent server is already running for this profile
+    existing_port = get_server_port(profile.name)
+    if existing_port is not None:
+        _run_proxy_with_port(profile, existing_port, claude_args, use_happy, persistent=True)
+    else:
+        # Start ephemeral proxy (original behavior)
+        asyncio.run(_run_proxy_async(profile, claude_args, use_happy))
+
+
+def _run_proxy_with_port(
+    profile: ProxyProfile,
+    port: int,
+    claude_args: list[str],
+    use_happy: bool = False,
+    persistent: bool = False,
+):
+    """Launch claude connecting to an already-running proxy on the given port."""
+    proxy_env = build_proxy_env(port, max_output_tokens=profile.max_output_tokens, max_context_tokens=profile.max_context_tokens, autocompact_pct=profile.autocompact_pct)
+    env = {**os.environ, **proxy_env}
+
+    if use_happy:
+        exe = _find_happy()
+        args = [exe] + claude_args
+    else:
+        exe = _find_claude()
+        args = [exe] + claude_args
+
+    os.execvpe(exe, args, env)
 
 
 async def _run_proxy_async(profile: ProxyProfile, claude_args: list[str], use_happy: bool = False):
@@ -130,7 +341,7 @@ async def _run_proxy_async(profile: ProxyProfile, claude_args: list[str], use_ha
         max_output_tokens=profile.max_output_tokens,
     )
 
-    click.echo(f"Proxy started on 127.0.0.1:{port} → {profile.api_url}", err=True)
+    click.echo(f"Proxy started on 127.0.0.1:{port} -> {profile.api_url}", err=True)
 
     proxy_env = build_proxy_env(port, max_output_tokens=profile.max_output_tokens, max_context_tokens=profile.max_context_tokens, autocompact_pct=profile.autocompact_pct)
     env = {**os.environ, **proxy_env}

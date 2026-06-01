@@ -11,6 +11,17 @@ import yaml
 CONFIG_DIR = Path.home() / ".ccr"
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
 
+_defaults: dict[str, Any] = {}
+
+
+def load_defaults() -> dict[str, Any]:
+    """Load top-level defaults from config file."""
+    if not CONFIG_FILE.exists():
+        return {}
+    with open(CONFIG_FILE) as f:
+        raw = yaml.safe_load(f)
+    return dict(raw.get("defaults", {})) if raw else {}
+
 
 @dataclass
 class DirectProfile:
@@ -41,20 +52,21 @@ class ProxyProfile:
 Profile = DirectProfile | ProxyProfile
 
 
-def _parse_profile(name: str, data: dict[str, Any]) -> Profile:
+def _parse_profile(name: str, data: dict[str, Any], defaults: dict[str, Any]) -> Profile:
     ptype = data.get("type", "direct")
     if ptype == "direct":
         return DirectProfile(name=name, env=dict(data.get("env", {})))
     if ptype == "proxy":
-        raw_max_out = data.get("max_output_tokens")
-        raw_max_ctx = data.get("max_context_tokens")
-        raw_ac_pct = data.get("autocompact_pct")
+        raw_max_out = data.get("max_output_tokens") or defaults.get("max_output_tokens")
+        raw_max_ctx = data.get("max_context_tokens") or defaults.get("max_context_tokens")
+        raw_ac_pct = data.get("autocompact_pct") or defaults.get("autocompact_pct")
+        raw_port = data.get("proxy_port") or defaults.get("proxy_port", 0)
         return ProxyProfile(
             name=name,
             api_url=data["api_url"],
             api_key=data.get("api_key", "dummy"),
             model=data.get("model", ""),
-            proxy_port=data.get("proxy_port", 0),
+            proxy_port=int(raw_port) if raw_port else 0,
             max_output_tokens=int(raw_max_out) if raw_max_out is not None else None,
             max_context_tokens=int(raw_max_ctx) if raw_max_ctx is not None else None,
             autocompact_pct=int(raw_ac_pct) if raw_ac_pct is not None else None,
@@ -72,6 +84,8 @@ def load_config() -> dict[str, Profile]:
     with open(CONFIG_FILE) as f:
         raw = yaml.safe_load(f)
 
+    defaults = dict(raw.get("defaults", {})) if raw else {}
+
     profiles_raw = raw.get("profiles", {})
     if not profiles_raw:
         print(f"No profiles defined in {CONFIG_FILE}", file=sys.stderr)
@@ -79,7 +93,7 @@ def load_config() -> dict[str, Profile]:
 
     profiles: dict[str, Profile] = {}
     for name, data in profiles_raw.items():
-        profiles[name] = _parse_profile(name, data)
+        profiles[name] = _parse_profile(name, data, defaults)
 
     return profiles
 
