@@ -84,7 +84,7 @@ def load_config() -> dict[str, Profile]:
     with open(CONFIG_FILE) as f:
         raw = yaml.safe_load(f)
 
-    defaults = dict(raw.get("defaults", {})) if raw else {}
+    defaults = dict(raw.get("defaults") or {}) if raw else {}
 
     profiles_raw = raw.get("profiles", {})
     if not profiles_raw:

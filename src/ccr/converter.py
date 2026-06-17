@@ -45,8 +45,14 @@ def _convert_messages(
     out: list[dict[str, Any]] = []
 
     if system:
-        sys_text = system if isinstance(system, str) else _blocks_to_text(system)
-        out.append({"role": "system", "content": sys_text})
+        sys_blocks = system if isinstance(system, list) else [{"type": "text", "text": system}]
+        # Strip the volatile billing header (contains per-request cch hash)
+        # that breaks prefix caching on downstream models.
+        sys_blocks = [b for b in sys_blocks
+                      if isinstance(b, dict) and not b.get("text", "").startswith("x-anthropic-billing-header:")]
+        if sys_blocks:
+            sys_text = _blocks_to_text(sys_blocks)
+            out.append({"role": "system", "content": sys_text})
 
     for msg in messages:
         role = msg["role"]
