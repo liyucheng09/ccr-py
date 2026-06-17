@@ -44,7 +44,7 @@ class ProxyServer:
         return self._actual_port
 
     async def start(self) -> int:
-        app = web.Application()
+        app = web.Application(client_max_size=32 * 1024 * 1024)
         app.router.add_post("/v1/messages", self._handle_messages)
         app.router.add_get("/health", self._handle_health)
 
