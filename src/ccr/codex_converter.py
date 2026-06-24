@@ -1038,13 +1038,36 @@ def response_tool_call_item_from_chat_name(
     return response_function_call_item(item_id, status, call_id, chat_name, arguments, reasoning)
 
 
+def parse_tool_arguments_object(arguments: str) -> dict:
+    """Parse tool arguments into an object, mirroring cc-switch.
+
+    Empty -> {}, valid JSON object -> that object, otherwise wrap the raw
+    string under {"query": ...} so callers always get a dict.
+    """
+    if not arguments.strip():
+        return {}
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, ValueError):
+        return {"query": arguments}
+    if isinstance(parsed, dict):
+        return parsed
+    return {"query": arguments}
+
+
 def response_tool_search_call_item(call_id: str, status: str, arguments: str, reasoning: str | None) -> dict:
+    # `execution: "client"` is REQUIRED: without it Codex treats the
+    # tool_search_call as server-side and never executes the search locally,
+    # so the turn stalls silently (the "hang" on "remind me every 7 min").
+    # `arguments` must be an object, not a JSON string, for the same reason.
+    # Mirrors cc-switch transform_codex_chat.rs:1534.
     item: dict = {
         "id": f"tsc_{call_id}",
         "type": "tool_search_call",
         "status": status,
         "call_id": call_id,
-        "arguments": arguments,
+        "execution": "client",
+        "arguments": parse_tool_arguments_object(arguments),
     }
     attach_optional_reasoning_content_field(item, reasoning)
     return item
