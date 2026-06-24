@@ -40,6 +40,7 @@ class ProxyProfile:
     api_key: str = "dummy"
     model: str = ""
     proxy_port: int = 0
+    codex_port: int | None = None
     max_output_tokens: int | None = None
     max_context_tokens: int | None = None
     autocompact_pct: int | None = None
@@ -61,12 +62,14 @@ def _parse_profile(name: str, data: dict[str, Any], defaults: dict[str, Any]) ->
         raw_max_ctx = data.get("max_context_tokens") or defaults.get("max_context_tokens")
         raw_ac_pct = data.get("autocompact_pct") or defaults.get("autocompact_pct")
         raw_port = data.get("proxy_port") or defaults.get("proxy_port", 0)
+        raw_codex_port = data.get("codex_port") or defaults.get("codex_port")
         return ProxyProfile(
             name=name,
             api_url=data["api_url"],
             api_key=data.get("api_key", "dummy"),
             model=data.get("model", ""),
             proxy_port=int(raw_port) if raw_port else 0,
+            codex_port=int(raw_codex_port) if raw_codex_port else None,
             max_output_tokens=int(raw_max_out) if raw_max_out is not None else None,
             max_context_tokens=int(raw_max_ctx) if raw_max_ctx is not None else None,
             autocompact_pct=int(raw_ac_pct) if raw_ac_pct is not None else None,

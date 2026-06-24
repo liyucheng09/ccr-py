@@ -118,7 +118,13 @@ def start(profile_name: str):
             continue
         try:
             urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
-            click.echo(f"Proxy server for '{profile_name}' started on 127.0.0.1:{port} -> {profile.api_url}")
+            if profile.codex_port:
+                click.echo(
+                    f"Proxy server for '{profile_name}' started: "
+                    f"anthropic on 127.0.0.1:{port}, codex on 127.0.0.1:{profile.codex_port} -> {profile.api_url}"
+                )
+            else:
+                click.echo(f"Proxy server for '{profile_name}' started on 127.0.0.1:{port} -> {profile.api_url}")
             return
         except (urllib.error.URLError, OSError):
             continue
@@ -255,6 +261,7 @@ def activate(profile_name: str):
 
 async def _serve_async(profile_name: str, profile: ProxyProfile):
     from .proxy import ProxyServer
+    from .codex_proxy import CodexProxyServer
 
     server = ProxyServer(
         api_url=profile.api_url,
@@ -265,9 +272,27 @@ async def _serve_async(profile_name: str, profile: ProxyProfile):
     )
     actual_port = await server.start()
 
+    codex_server: CodexProxyServer | None = None
+    codex_port: int | None = None
+    if profile.codex_port:
+        codex_server = CodexProxyServer(
+            api_url=profile.api_url,
+            api_key=profile.api_key,
+            model=profile.model,
+            port=profile.codex_port,
+        )
+        codex_port = await codex_server.start()
+
     save_server_info(profile_name, os.getpid(), actual_port)
 
-    click.echo(f"Serving '{profile_name}' on 127.0.0.1:{actual_port} -> {profile.api_url}", err=True)
+    if codex_port:
+        click.echo(
+            f"Serving '{profile_name}' on 127.0.0.1:{actual_port} (anthropic) "
+            f"+ 127.0.0.1:{codex_port} (codex) -> {profile.api_url}",
+            err=True,
+        )
+    else:
+        click.echo(f"Serving '{profile_name}' on 127.0.0.1:{actual_port} -> {profile.api_url}", err=True)
 
     loop = asyncio.get_event_loop()
     stop_event = asyncio.Event()
@@ -283,6 +308,8 @@ async def _serve_async(profile_name: str, profile: ProxyProfile):
     finally:
         from .server_state import remove_server_info
         await server.stop()
+        if codex_server is not None:
+            await codex_server.stop()
         remove_server_info(profile_name)
         click.echo(f"Proxy server for '{profile_name}' stopped.", err=True)
 
@@ -332,6 +359,8 @@ def _run_proxy_with_port(
 
 async def _run_proxy_async(profile: ProxyProfile, claude_args: list[str], use_happy: bool = False):
     from .proxy import run_proxy_until_done
+    from .codex_proxy import run_codex_proxy_until_done
+    from .server_state import save_server_info, remove_server_info
 
     server, port = await run_proxy_until_done(
         api_url=profile.api_url,
@@ -340,6 +369,18 @@ async def _run_proxy_async(profile: ProxyProfile, claude_args: list[str], use_ha
         port=profile.proxy_port,
         max_output_tokens=profile.max_output_tokens,
     )
+
+    codex_server = None
+    if profile.codex_port:
+        codex_server, _ = await run_codex_proxy_until_done(
+            api_url=profile.api_url,
+            api_key=profile.api_key,
+            model=profile.model,
+            port=profile.codex_port,
+        )
+
+    # Register so future `ccr <profile>` can reuse this server
+    save_server_info(profile.name, os.getpid(), port)
 
     click.echo(f"Proxy started on 127.0.0.1:{port} -> {profile.api_url}", err=True)
 
@@ -362,6 +403,9 @@ async def _run_proxy_async(profile: ProxyProfile, claude_args: list[str], use_ha
         await proc.wait()
     finally:
         await server.stop()
+        if codex_server is not None:
+            await codex_server.stop()
+        remove_server_info(profile.name)
         click.echo("Proxy stopped.", err=True)
 
     sys.exit(proc.returncode or 0)
