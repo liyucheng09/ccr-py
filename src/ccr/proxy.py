@@ -18,6 +18,7 @@ from .converter import (
     openai_to_anthropic_response,
     StreamConverter,
 )
+from .debug_log import DebugTarget, RequestRecorder, make_recorder
 
 
 def _is_disconnect(exc: BaseException) -> bool:
@@ -30,12 +31,15 @@ def _is_disconnect(exc: BaseException) -> bool:
 
 
 class ProxyServer:
-    def __init__(self, api_url: str, api_key: str = "dummy", model: str = "", port: int = 0, max_output_tokens: int | None = None):
+    def __init__(self, api_url: str, api_key: str = "dummy", model: str = "", port: int = 0, max_output_tokens: int | None = None, debug: DebugTarget | None = None, debug_keep: int = 100, profile_name: str = ""):
         self.api_url = api_url
         self.api_key = api_key
         self.model = model
         self.port = port
         self.max_output_tokens = max_output_tokens
+        self.debug = debug
+        self.debug_keep = debug_keep
+        self.profile_name = profile_name
         self._runner: web.AppRunner | None = None
         self._actual_port: int = 0
 
@@ -82,6 +86,12 @@ class ProxyServer:
         body = await request.json()
         is_stream = body.get("stream", False)
 
+        rec = make_recorder(
+            self.debug, self.profile_name, "messages", self.debug_keep, "anthropic"
+        )
+        if rec is not None:
+            rec.log_request_body(body)
+
         openai_req = anthropic_to_openai_request(body, model_override=self.model, max_output_tokens=self.max_output_tokens)
 
         headers = {"Content-Type": "application/json"}
@@ -98,6 +108,9 @@ class ProxyServer:
             ) as upstream:
                 if upstream.status != 200:
                     error_body = await upstream.text()
+                    if rec is not None:
+                        rec.log_upstream_chunk(error_body.encode("utf-8", errors="replace"))
+                        rec.close("upstream_error", status=upstream.status)
                     return web.Response(
                         status=upstream.status,
                         text=error_body,
@@ -105,14 +118,17 @@ class ProxyServer:
                     )
 
                 if is_stream:
-                    return await self._stream_response(request, upstream)
+                    return await self._stream_response(request, upstream, rec)
                 else:
                     resp_data = await upstream.json()
+                    if rec is not None:
+                        rec.log_upstream_chunk(json.dumps(resp_data, ensure_ascii=False).encode())
+                        rec.close("non_stream_ok")
                     anthropic_resp = openai_to_anthropic_response(resp_data, model=self.model)
                     return web.json_response(anthropic_resp)
 
     async def _stream_response(
-        self, request: web.Request, upstream: Any
+        self, request: web.Request, upstream: Any, rec: RequestRecorder | None = None
     ) -> web.StreamResponse:
         response = web.StreamResponse(
             status=200,
@@ -152,9 +168,16 @@ class ProxyServer:
                     return response
 
             buffer = ""
+            first_byte_logged = False
             async for chunk_bytes in upstream.content.iter_any():
                 if client_disconnected:
                     break
+
+                if rec is not None:
+                    rec.log_upstream_chunk(chunk_bytes)
+                    if not first_byte_logged:
+                        first_byte_logged = True
+                        rec.event("first_byte")
 
                 buffer += chunk_bytes.decode("utf-8", errors="replace")
 
@@ -167,6 +190,8 @@ class ProxyServer:
                     if line.startswith("data: "):
                         data_str = line[6:]
                         if data_str.strip() == "[DONE]":
+                            if rec is not None:
+                                rec.event("done")
                             for event in converter.finish_events("stop"):
                                 if not await _safe_write(event.encode()):
                                     return response
@@ -174,6 +199,14 @@ class ProxyServer:
 
                         try:
                             chunk = json.loads(data_str)
+                            if rec is not None and isinstance(chunk, dict):
+                                choices = chunk.get("choices")
+                                if isinstance(choices, list) and choices:
+                                    fr = choices[0].get("finish_reason") if isinstance(choices[0], dict) else None
+                                    if fr:
+                                        rec.event("finish_reason", value=fr)
+                                if chunk.get("usage"):
+                                    rec.event("usage", usage=chunk["usage"])
                             for event in converter.feed_chunk(chunk):
                                 if not await _safe_write(event.encode()):
                                     return response
@@ -181,6 +214,8 @@ class ProxyServer:
                             continue
 
             if not client_disconnected and buffer.strip():
+                if rec is not None:
+                    rec.event("flush_trailing", remaining_len=len(buffer.strip()))
                 line = buffer.strip()
                 if line.startswith("data: ") and line[6:].strip() != "[DONE]":
                     try:
@@ -199,13 +234,20 @@ class ProxyServer:
                         logger.debug("Client disconnected during stream close")
                     else:
                         raise
+            if rec is not None:
+                rec.close("ok", client_disconnected=client_disconnected)
         except asyncio.CancelledError:
             logger.debug("Stream cancelled by client")
+            if rec is not None:
+                rec.close("cancelled")
         except BaseException as exc:
             if _is_disconnect(exc):
                 logger.debug("Client disconnected during stream")
             else:
                 logger.error("Stream error: %s", exc)
+            if rec is not None:
+                rec.close("client_disconnected" if _is_disconnect(exc) else "error",
+                          error=type(exc).__name__)
 
         return response
 
@@ -222,8 +264,15 @@ async def run_proxy_until_done(
     model: str,
     port: int = 0,
     max_output_tokens: int | None = None,
+    debug: DebugTarget | None = None,
+    debug_keep: int = 100,
+    profile_name: str = "",
 ) -> tuple[ProxyServer, int]:
     """Start proxy and return (server, port). Caller is responsible for stopping."""
-    server = ProxyServer(api_url=api_url, api_key=api_key, model=model, port=port, max_output_tokens=max_output_tokens)
+    server = ProxyServer(
+        api_url=api_url, api_key=api_key, model=model, port=port,
+        max_output_tokens=max_output_tokens, debug=debug, debug_keep=debug_keep,
+        profile_name=profile_name,
+    )
     actual_port = await server.start()
     return server, actual_port

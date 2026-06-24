@@ -8,6 +8,7 @@ import signal
 import sys
 from pathlib import Path
 import shutil
+import subprocess
 import time
 
 import click
@@ -28,6 +29,47 @@ from .server_state import (
     stop_server,
     list_running_servers,
 )
+from .debug_log import DebugTarget, DEFAULT_KEEP
+
+
+def _strip_debug_flags(args: list[str]) -> tuple[DebugTarget | None, int, list[str]]:
+    """Extract ccr --debug / --debug-keep from a raw arg list (run subcommand).
+
+    These are ccr flags, not claude args, so they must be consumed before the
+    remaining args are forwarded to claude. Mirrors the existing --happy handling.
+    Returns (debug_target, keep, remaining_args).
+    """
+    remaining: list[str] = []
+    debug_value: str | None = None
+    keep = DEFAULT_KEEP
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--debug":
+            debug_value = "all"
+            i += 1
+            continue
+        if a.startswith("--debug="):
+            debug_value = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a == "--debug-keep" and i + 1 < len(args):
+            try:
+                keep = int(args[i + 1])
+            except ValueError:
+                pass
+            i += 2
+            continue
+        if a.startswith("--debug-keep="):
+            try:
+                keep = int(a.split("=", 1)[1])
+            except ValueError:
+                pass
+            i += 1
+            continue
+        remaining.append(a)
+        i += 1
+    return DebugTarget.parse(debug_value), keep, remaining
 
 
 class CCRGroup(click.Group):
@@ -59,17 +101,26 @@ def run(profile_name: str, claude_args: tuple[str, ...]):
     if use_happy:
         args.remove("--happy")
 
+    debug, debug_keep, args = _strip_debug_flags(args)
+
     profile = get_profile(profile_name)
 
     if isinstance(profile, DirectProfile):
         _run_direct(profile, args, use_happy)
     else:
-        _run_proxy(profile, args, use_happy)
+        _run_proxy(profile, args, use_happy, debug=debug, debug_keep=debug_keep)
 
 
 @main.command()
 @click.argument("profile_name")
-def start(profile_name: str):
+@click.option("--debug", "debug", default=None,
+              type=click.Choice(["codex", "anthropic", "all"], case_sensitive=False),
+              is_flag=False, flag_value="all",
+              help="Record all raw request/upstream bytes to ~/.ccr/debug/<profile>/. "
+                   "Optional value: codex, anthropic, or all (default).")
+@click.option("--debug-keep", "debug_keep", default=DEFAULT_KEEP, show_default=True, type=int,
+              help="Number of recent request recordings to keep per profile.")
+def start(profile_name: str, debug: str | None, debug_keep: int):
     """Start a persistent proxy server for a profile.
 
     Only works with proxy-type profiles (e.g. glm5).
@@ -86,16 +137,19 @@ def start(profile_name: str):
         click.echo(f"Proxy server for '{profile_name}' is already running on port {port}.")
         return
 
-    # Spawn background process: ccr serve <profile>
+    # Spawn background process: ccr serve <profile> [--debug ...]
     ccr_path = shutil.which("ccr")
     if not ccr_path:
         ccr_path = sys.executable.replace("python", "ccr")
 
-    import subprocess
+    serve_argv = [ccr_path, "serve", profile_name]
+    if debug is not None:
+        serve_argv += ["--debug", debug, "--debug-keep", str(debug_keep)]
+
     # Capture stderr to surface startup errors (e.g. port in use)
     stderr_pipe = subprocess.PIPE
     proc = subprocess.Popen(
-        [ccr_path, "serve", profile_name],
+        serve_argv,
         stdout=subprocess.DEVNULL,
         stderr=stderr_pipe,
         start_new_session=True,
@@ -127,6 +181,8 @@ def start(profile_name: str):
                 )
             else:
                 click.echo(f"Proxy server for '{profile_name}' started on 127.0.0.1:{port} -> {profile.api_url}")
+            if debug is not None:
+                click.echo(f"  debug: recording {debug} -> ~/.ccr/debug/{profile_name}/ (keep {debug_keep})")
             return
         except (urllib.error.URLError, OSError):
             continue
@@ -224,7 +280,13 @@ def list_profiles():
 
 @main.command("serve", hidden=True)
 @click.argument("profile_name")
-def serve(profile_name: str):
+@click.option("--debug", "debug", default=None,
+              type=click.Choice(["codex", "anthropic", "all"], case_sensitive=False),
+              is_flag=False, flag_value="all",
+              help="Record raw request/upstream bytes to ~/.ccr/debug/<profile>/.")
+@click.option("--debug-keep", "debug_keep", default=DEFAULT_KEEP, show_default=True, type=int,
+              help="Number of recent request recordings to keep per profile.")
+def serve(profile_name: str, debug: str | None, debug_keep: int):
     """Internal: run a persistent proxy server. Called by 'ccr start'."""
     profile = get_profile(profile_name)
 
@@ -232,7 +294,8 @@ def serve(profile_name: str):
         click.echo(f"Cannot serve a direct profile.", err=True)
         sys.exit(1)
 
-    asyncio.run(_serve_async(profile_name, profile))
+    debug_target = DebugTarget.parse(debug)
+    asyncio.run(_serve_async(profile_name, profile, debug=debug_target, debug_keep=debug_keep))
 
 
 @main.command()
@@ -261,6 +324,7 @@ def activate(profile_name: str):
         click.echo(f"export {key}={_shell_quote(value)}")
 
 
+
 @main.command("remote-sync")
 @click.argument("ssh_server")
 @click.option("--source", "source_file", default=None, help="Local config file to sync (default: ~/.ccr/config.yaml.ssh)")
@@ -279,7 +343,6 @@ def remote_sync(ssh_server: str, source_file: str | None, dest_path: str | None)
         click.echo(f"Source file not found: {src}", err=True)
         sys.exit(1)
 
-    import subprocess
     # Ensure remote ~/.ccr directory exists
     mkdir_cmd = ["ssh", ssh_server, "mkdir", "-p", "~/.ccr"]
     click.echo(f"Ensuring remote directory exists on {ssh_server}...")
@@ -299,7 +362,12 @@ def remote_sync(ssh_server: str, source_file: str | None, dest_path: str | None)
     click.echo(f"Done. {src} synced to {ssh_server}:{dst}")
 
 
-async def _serve_async(profile_name: str, profile: ProxyProfile):
+async def _serve_async(
+    profile_name: str,
+    profile: ProxyProfile,
+    debug: DebugTarget | None = None,
+    debug_keep: int = DEFAULT_KEEP,
+):
     from .proxy import ProxyServer
     from .codex_proxy import CodexProxyServer
 
@@ -309,6 +377,7 @@ async def _serve_async(profile_name: str, profile: ProxyProfile):
         model=profile.model,
         port=profile.proxy_port,
         max_output_tokens=profile.max_output_tokens,
+        debug=debug, debug_keep=debug_keep, profile_name=profile_name,
     )
     actual_port = await server.start()
 
@@ -320,6 +389,7 @@ async def _serve_async(profile_name: str, profile: ProxyProfile):
             api_key=profile.api_key,
             model=profile.model,
             port=profile.codex_port,
+            debug=debug, debug_keep=debug_keep, profile_name=profile_name,
         )
         codex_port = await codex_server.start()
 
@@ -333,6 +403,13 @@ async def _serve_async(profile_name: str, profile: ProxyProfile):
         )
     else:
         click.echo(f"Serving '{profile_name}' on 127.0.0.1:{actual_port} -> {profile.api_url}", err=True)
+    if debug is not None:
+        targets = []
+        if debug.codex:
+            targets.append("codex")
+        if debug.anthropic:
+            targets.append("anthropic")
+        click.echo(f"  debug: recording {'+'.join(targets)} -> ~/.ccr/debug/{profile_name}/ (keep {debug_keep})", err=True)
 
     loop = asyncio.get_event_loop()
     stop_event = asyncio.Event()
@@ -366,14 +443,24 @@ def _run_direct(profile: DirectProfile, claude_args: list[str], use_happy: bool 
         os.execvpe(claude_path, args, env)
 
 
-def _run_proxy(profile: ProxyProfile, claude_args: list[str], use_happy: bool = False):
+def _run_proxy(
+    profile: ProxyProfile, claude_args: list[str], use_happy: bool = False,
+    debug: DebugTarget | None = None, debug_keep: int = DEFAULT_KEEP,
+):
     # Check if a persistent server is already running for this profile
     existing_port = get_server_port(profile.name)
     if existing_port is not None:
+        if debug is not None:
+            click.echo(
+                f"Note: reusing already-running '{profile.name}' server; --debug only applies to a "
+                f"freshly-started server. Run `ccr stop {profile.name}` then `ccr {profile.name} --debug` "
+                f"to enable recording.",
+                err=True,
+            )
         _run_proxy_with_port(profile, existing_port, claude_args, use_happy, persistent=True)
     else:
         # Start ephemeral proxy (original behavior)
-        asyncio.run(_run_proxy_async(profile, claude_args, use_happy))
+        asyncio.run(_run_proxy_async(profile, claude_args, use_happy, debug=debug, debug_keep=debug_keep))
 
 
 def _run_proxy_with_port(
@@ -397,7 +484,10 @@ def _run_proxy_with_port(
     os.execvpe(exe, args, env)
 
 
-async def _run_proxy_async(profile: ProxyProfile, claude_args: list[str], use_happy: bool = False):
+async def _run_proxy_async(
+    profile: ProxyProfile, claude_args: list[str], use_happy: bool = False,
+    debug: DebugTarget | None = None, debug_keep: int = DEFAULT_KEEP,
+):
     from .proxy import run_proxy_until_done
     from .codex_proxy import run_codex_proxy_until_done
     from .server_state import save_server_info, remove_server_info
@@ -408,6 +498,7 @@ async def _run_proxy_async(profile: ProxyProfile, claude_args: list[str], use_ha
         model=profile.model,
         port=profile.proxy_port,
         max_output_tokens=profile.max_output_tokens,
+        debug=debug, debug_keep=debug_keep, profile_name=profile.name,
     )
 
     codex_server = None
@@ -417,12 +508,20 @@ async def _run_proxy_async(profile: ProxyProfile, claude_args: list[str], use_ha
             api_key=profile.api_key,
             model=profile.model,
             port=profile.codex_port,
+            debug=debug, debug_keep=debug_keep, profile_name=profile.name,
         )
 
     # Register so future `ccr <profile>` can reuse this server
     save_server_info(profile.name, os.getpid(), port)
 
     click.echo(f"Proxy started on 127.0.0.1:{port} -> {profile.api_url}", err=True)
+    if debug is not None:
+        targets = []
+        if debug.codex:
+            targets.append("codex")
+        if debug.anthropic:
+            targets.append("anthropic")
+        click.echo(f"  debug: recording {'+'.join(targets)} -> ~/.ccr/debug/{profile.name}/ (keep {debug_keep})", err=True)
 
     proxy_env = build_proxy_env(port, max_output_tokens=profile.max_output_tokens, max_context_tokens=profile.max_context_tokens, autocompact_pct=profile.autocompact_pct)
     env = {**os.environ, **proxy_env}
