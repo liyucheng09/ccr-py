@@ -6,6 +6,7 @@ import asyncio
 import os
 import signal
 import sys
+from pathlib import Path
 import shutil
 import time
 
@@ -18,6 +19,7 @@ from .config import (
     DirectProfile,
     ProxyProfile,
     CONFIG_FILE,
+    CONFIG_DIR,
 )
 from .server_state import (
     save_server_info,
@@ -257,6 +259,44 @@ def activate(profile_name: str):
 
     for key, value in sorted(env.items()):
         click.echo(f"export {key}={_shell_quote(value)}")
+
+
+@main.command("remote-sync")
+@click.argument("ssh_server")
+@click.option("--source", "source_file", default=None, help="Local config file to sync (default: ~/.ccr/config.yaml.ssh)")
+@click.option("--dest", "dest_path", default=None, help="Remote destination path (default: ~/.ccr/config.yaml)")
+def remote_sync(ssh_server: str, source_file: str | None, dest_path: str | None):
+    """Copy local SSH config to a remote server via scp.
+
+    By default syncs ~/.ccr/config.yaml.ssh to <ssh_server>:~/.ccr/config.yaml.
+
+    Example: ccr remote-sync sg_g8
+    """
+    src = Path(source_file) if source_file else CONFIG_DIR / "config.yaml.ssh"
+    dst = dest_path or "~/.ccr/config.yaml"
+
+    if not src.exists():
+        click.echo(f"Source file not found: {src}", err=True)
+        sys.exit(1)
+
+    import subprocess
+    # Ensure remote ~/.ccr directory exists
+    mkdir_cmd = ["ssh", ssh_server, "mkdir", "-p", "~/.ccr"]
+    click.echo(f"Ensuring remote directory exists on {ssh_server}...")
+    ret = subprocess.call(mkdir_cmd)
+    if ret != 0:
+        click.echo(f"Failed to create remote directory on {ssh_server} (exit {ret}).", err=True)
+        sys.exit(1)
+
+    # scp the file
+    scp_cmd = ["scp", str(src), f"{ssh_server}:{dst}"]
+    click.echo(f"Syncing {src} -> {ssh_server}:{dst} ...")
+    ret = subprocess.call(scp_cmd)
+    if ret != 0:
+        click.echo(f"scp failed (exit {ret}).", err=True)
+        sys.exit(1)
+
+    click.echo(f"Done. {src} synced to {ssh_server}:{dst}")
 
 
 async def _serve_async(profile_name: str, profile: ProxyProfile):
