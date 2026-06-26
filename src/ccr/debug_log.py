@@ -30,8 +30,10 @@ class DebugTarget:
 
     @classmethod
     def parse(cls, value: str | None) -> "DebugTarget | None":
-        """Parse a --debug argument. ``None``/empty → both. Unknown → None (off)."""
-        if value is None or value == "" or value == "all":
+        """Parse a --debug argument. ``None``/empty → off. ``all`` → both. Unknown → off."""
+        if value is None or value == "":
+            return None
+        if value == "all":
             return cls(codex=True, anthropic=True)
         if value == "codex":
             return cls(codex=True, anthropic=False)
