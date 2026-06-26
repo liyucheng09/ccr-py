@@ -514,7 +514,14 @@ async def _run_proxy_async(
     # Register so future `ccr <profile>` can reuse this server
     save_server_info(profile.name, os.getpid(), port)
 
-    click.echo(f"Proxy started on 127.0.0.1:{port} -> {profile.api_url}", err=True)
+    if profile.codex_port:
+        click.echo(
+            f"Proxy started: anthropic on 127.0.0.1:{port}, "
+            f"codex on 127.0.0.1:{profile.codex_port} -> {profile.api_url}",
+            err=True,
+        )
+    else:
+        click.echo(f"Proxy started on 127.0.0.1:{port} -> {profile.api_url}", err=True)
     if debug is not None:
         targets = []
         if debug.codex:
